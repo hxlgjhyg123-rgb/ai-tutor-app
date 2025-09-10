@@ -1,3 +1,7 @@
 google-generativeai
 streamlit
 biopython
+langchain-google-genai
+langchain
+faiss-cpu
+pypdf

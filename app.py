@@ -2,10 +2,11 @@
 # 1. 导入项目所需的全部库
 # ==============================================================================
 import os
-import re
 import streamlit as st
 import google.generativeai as genai
 from Bio import Entrez
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.vectorstores import FAISS
 
 # ==============================================================================
 # 2. API 配置
@@ -13,174 +14,125 @@ from Bio import Entrez
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
-except Exception:
-    st.error("无法配置API密钥！请确保您已在Streamlit Cloud的设置中正确添加了GEMINI_API_KEY。")
+except Exception as e:
+    st.error(f"Gemini API密钥配置失败: {e}")
 
 # ==============================================================================
-# 3. 定义核心函数 (已全面升级)
+# 3. 定义核心函数 (双知识源检索)
 # ==============================================================================
 
-# --- PubMed搜索函数 (稍作优化) ---
-def search_pubmed(queries, max_results=2):
-    """根据一个关键词列表，去PubMed搜索并返回格式化的文献信息。"""
+# --- 函数1：从我们自建的知识库(FAISS)中检索 ---
+# 使用Streamlit的缓存功能，避免每次都重新加载模型和索引
+@st.cache_resource
+def load_vector_store():
     try:
-        Entrez.email = "307660349@qq.com" # <-- (重要) 请务必替换为您自己的真实邮箱!
-        
-        all_id_list = []
-        for query in queries:
-            handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="relevance")
-            record = Entrez.read(handle)
-            handle.close()
-            all_id_list.extend(record["IdList"])
-        
-        # 去重
-        unique_id_list = list(set(all_id_list))
-        if not unique_id_list:
-            return "在PubMed中未找到与您输入内容高度相关的文献。", []
+        # 注意：这里的模型名称是用于“嵌入”的，和后面用于“生成”的模型可以不同
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+        # allow_dangerous_deserialization=True 是加载FAISS索引所必需的
+        vector_store = FAISS.load_local("faiss_index_gut_microbiome", embeddings, allow_dangerous_deserialization=True)
+        return vector_store
+    except Exception as e:
+        st.error(f"加载本地知识库失败！请确保'faiss_index_gut_microbiome'文件夹已上传至GitHub仓库。错误: {e}")
+        return None
 
-        handle = Entrez.efetch(db="pubmed", id=unique_id_list, rettype="medline", retmode="text")
+def search_local_kb(query, k=3):
+    vector_store = load_vector_store()
+    if vector_store:
+        results = vector_store.similarity_search(query, k=k)
+        return "\n\n".join([doc.page_content for doc in results])
+    return ""
+
+# --- 函数2：从PubMed实时检索 ---
+def search_pubmed(query, max_results=3):
+    # (这个函数和我们之前V2版本中的完全一样)
+    try:
+        Entrez.email = "your_email@example.com" # <-- (重要) 请务必替换为您自己的真实邮箱!
+        handle = Entrez.esearch(db="pubmed", term=query, retmax=max_results, sort="relevance")
+        record = Entrez.read(handle)
+        handle.close()
+        id_list = record["IdList"]
+        if not id_list: return "", []
+        handle = Entrez.efetch(db="pubmed", id=id_list, rettype="medline", retmode="text")
         records_text = handle.read()
         handle.close()
         
         formatted_references = []
         raw_text_for_llm = ""
         papers = records_text.strip().split("\n\n")
-        
         for i, paper_text in enumerate(papers):
             try:
                 pmid = [line.split("- ")[1] for line in paper_text.split('\n') if line.startswith("PMID-")][0]
                 title = [line.split("- ")[1] for line in paper_text.split('\n') if line.startswith("TI  -")][0]
-                abstract_lines = [line[6:] for line in paper_text.split('\n') if line.startswith("AB  -")]
-                abstract = " ".join(abstract_lines)
-
                 ref_string_for_display = f"**{i+1}. {title}** (PMID: {pmid})"
                 formatted_references.append(ref_string_for_display)
-                
-                raw_text_for_llm += f"--- 参考资料 {i+1} (PMID: {pmid}) ---\n标题: {title}\n摘要: {abstract}\n\n"
-            except IndexError:
-                continue
-
+                raw_text_for_llm += f"--- PubMed文献 {i+1} (PMID: {pmid}) ---\n{paper_text}\n\n"
+            except IndexError: continue
         return raw_text_for_llm, formatted_references
-    except Exception as e:
-        return f"PubMed搜索时发生错误: {e}", []
+    except Exception as e: return f"PubMed搜索时发生错误: {e}", []
 
-# --- Gemini API调用函数 (保持不变) ---
+# --- 函数3：调用Gemini API进行最终生成 ---
 def ask_gemini(prompt_text):
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        response = model.generate_content(prompt_text, request_options={'timeout': 120}) # 增加超时时间
+        model = genai.GenerativeModel('gemini-1.5-pro-latest') # 使用更强大的Pro模型
+        response = model.generate_content(prompt_text, request_options={'timeout': 180})
         return response.text
-    except Exception as e:
-        return f"调用Gemini API时发生错误: {e}"
-
-# --- 新增：智能生成搜索关键词的函数 ---
-def generate_search_queries(role, experiment_type, observation, conclusion, method):
-    """第一步AI调用：根据角色和输入，生成PubMed搜索关键词。"""
-    
-    # 针对不同角色，生成关键词的指令也不同
-    query_generation_prompts = {
-        "苏格拉底导师 (Socratic Tutor)": f"我是一名学生，正在学习关于“{experiment_type}”的知识，我对“{observation}”这个现象感到困惑。请为我生成2个PubMed搜索关键词，帮助我查找相关的基础原理或背景知识。",
-        "魔鬼代言人 (Devil's Advocate)": f"我的结论是“{conclusion}”，方法是“{method}”。请为我生成3个PubMed搜索关键词，用于查找能够挑战我这个结论的文献，比如寻找替代解释、实验方法的缺陷或矛盾的证据。",
-        "文献连接者 (Knowledge Connector)": f"我的核心发现是“{conclusion}”。请为我生成3个PubMed搜索关键词，用于查找与这个发现最相关的研究背景和前沿进展。",
-        "下一步战略家 (Next-Step Strategist)": f"我的发现是“{conclusion}”。请为我生成3个PubMed搜索关键词，用于查找可以用来验证这个发现的实验方法，或者可以探索的下游机制研究。"
-    }
-    
-    prompt = f"""{query_generation_prompts[role]}
-    请只返回关键词列表，用换行符分隔，不要任何多余的解释。例如：
-    Keyword 1
-    Keyword 2
-    """
-    
-    response_text = ask_gemini(prompt)
-    # 从返回的文本中解析出关键词列表
-    queries = [line.strip() for line in response_text.split('\n') if line.strip()]
-    return queries
-
-
-# --- 最终的核心引擎函数 (实现两步走逻辑) ---
-def get_ai_feedback_with_rag(role, experiment_type, observation, conclusion, method):
-    # 1. 第一步：智能生成搜索关键词
-    status_text.info("第一步：AI正在思考应该查阅哪些资料...")
-    search_queries = generate_search_queries(role, experiment_type, observation, conclusion, method)
-    if not search_queries:
-        return "无法生成有效的搜索关键词，请尝试更详细地描述您的问题。", []
-    
-    status_text.info(f"已生成搜索关键词：{', '.join(search_queries)}")
-
-    # 2. 第二步：用生成的关键词去PubMed检索
-    status_text.info("第二步：正在PubMed数据库中检索相关文献...")
-    retrieved_papers, formatted_references = search_pubmed(search_queries)
-    if not formatted_references:
-        return "未能在PubMed中找到与AI生成的关键词高度相关的文献。", []
-    
-    status_text.success(f"已成功检索到 {len(formatted_references)} 篇相关文献！")
-
-    # 3. 第三步：整合所有信息，进行最终的RAG生成
-    status_text.info("第三步：AI正在阅读文献并组织最终的反馈...")
-    
-    final_rag_prompt = f"""
-    你是一位严谨的AI科研导师，当前扮演的角色是：**{role}**。
-
-    这是用户的输入信息：
-    - 实验领域/类型: {experiment_type}
-    - 实验方法: {method}
-    - 观察: {observation}
-    - 初步结论/核心发现: {conclusion}
-
-    ---
-    这是我为你从PubMed检索到的真实文献摘要，请你**严格依据**这些信息来完成你的角色任务。
-    {retrieved_papers}
-    ---
-
-    请开始你的回答。在你的回答中，当论证关键信息时，必须以 `[PMID: XXXXXX]` 的格式清晰地引用你参考的文献。
-    """
-    
-    feedback = ask_gemini(final_rag_prompt)
-    return feedback, formatted_references
+    except Exception as e: return f"调用Gemini API时发生错误: {e}"
 
 # ==============================================================================
-# 5. 构建Streamlit用户界面
+# 4. 构建Streamlit用户界面
 # ==============================================================================
-st.set_page_config(layout="wide", page_title="AI科研思维训练工具 V3.0")
-st.title("🔬 AI 科研思维训练工具 (全角色文献引用版)")
-st.markdown("本工具的每一个回答都基于实时的PubMed文献检索，确保关键论据有据可查。")
+st.set_page_config(layout="wide", page_title="AI科研思维训练工具 V4.0")
+st.title("🔬 AI 科研思维训练工具 (双知识源版)")
+st.markdown("本工具的回答基于**您的专属知识库**和**实时的PubMed文献**，由Gemini 1.5 Pro模型进行综合分析。")
 
 with st.sidebar:
     st.header("⚙️ 输入参数")
-    role = st.selectbox(
-        "1. 请选择AI导师的角色", 
-        ["苏格拉底导师 (Socratic Tutor)", "魔鬼代言人 (Devil's Advocate)", "文献连接者 (Knowledge Connector)", "下一步战略家 (Next-Step Strategist)"]
-    )
-    experiment_type = st.text_input("2. 实验领域/类型", placeholder="例如：肿瘤免疫治疗, Western Blot")
-    method = st.text_area("3. 简述实验方法", height=100)
-    observation = st.text_area("4. 描述您的实验观察", height=100)
-    conclusion = st.text_area("5. 您的初步结论/核心发现", height=100)
-    submit_button = st.button("🚀 获取AI导师的反馈", use_container_width=True)
+    user_question = st.text_area("1. 请输入您的核心问题或发现陈述", height=150, placeholder="例如：我的实验发现，在小鼠模型中，补充丁酸盐能够显著改善高脂饮食诱导的肠道屏障功能障碍。")
+    submit_button = st.button("🚀 获取AI导师的综合分析", use_container_width=True)
 
-st.header("💬 AI导师的反馈")
-
-# 使用一个容器来放置状态文本和最终结果
+st.header("💬 AI导师的综合反馈")
 output_container = st.container()
 
-if submit_button:
-    # 在主界面显示状态更新
+if submit_button and user_question:
     with output_container:
-        status_text = st.empty()
-        feedback, references = get_ai_feedback_with_rag(role, experiment_type, observation, conclusion, method)
-        
-        # 清空状态文本
-        status_text.empty()
+        # 1. 并行检索
+        with st.spinner('正在检索您的专属知识库和PubMed...'):
+            local_context = search_local_kb(user_question)
+            pubmed_context, pubmed_references = search_pubmed(user_question)
 
-        # 显示最终结果
-        col1, col2 = st.columns([2, 1.5])
-        with col1:
-            st.subheader("📝 AI生成的分析与洞见")
-            st.markdown(feedback)
-        if references:
-            with col2:
-                st.subheader("📚 引用的参考文献 (来自PubMed)")
-                for ref in references:
+        # 2. 整合信息并生成最终Prompt
+        with st.spinner('已获取资料，正在由Gemini 1.5 Pro进行综合分析...'):
+            final_prompt = f"""
+            你是一位顶级的生物医学科研专家，擅长整合多源信息进行严谨的分析。
+
+            **用户的核心问题/发现是：**
+            {user_question}
+
+            ---
+            **信息源一：来自用户专属知识库的核心内容：**
+            {local_context if local_context else "（未在专属知识库中找到直接相关内容）"}
+            ---
+            **信息源二：来自PubMed的最新相关文献：**
+            {pubmed_context if pubmed_context else "（未在PubMed中找到直接相关内容）"}
+            ---
+
+            **你的任务：**
+            请综合以上所有信息，为用户提供一个全面、深入、且有条理的分析报告。报告应包含：
+            1.  **核心观点总结**：直接回答或分析用户提出的问题/发现。
+            2.  **证据支持**：你的关键论点必须有依据。如果依据来自用户的知识库，请说明。如果依据来自PubMed，请务必以 `[PMID: XXXXXX]` 的格式引用。
+            3.  **洞见与建议**：基于综合分析，提出可能的机制、潜在的矛盾点或下一步的关键实验建议。
+            """
+            
+            # 3. 获取最终反馈
+            final_feedback = ask_gemini(final_prompt)
+
+            # 4. 显示结果
+            st.subheader("📝 AI生成的综合分析报告")
+            st.markdown(final_feedback)
+            
+            if pubmed_references:
+                st.subheader("📚 报告中引用的实时PubMed文献")
+                for ref in pubmed_references:
                     st.markdown(f"- {ref}")
 else:
-    with output_container:
-        st.info("请在左侧填写信息并点击按钮，AI的反馈将显示在这里。")
+    output_container.info("请在左侧输入您的问题或发现，然后点击按钮开始分析。")
